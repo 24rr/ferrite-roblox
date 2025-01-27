@@ -1,13 +1,32 @@
 # Ferrite
 
-Ferrite is a memory dumping tool inspired by Vulkan, rewritten in Rust for enhanced safety and performance. It restores PE images by dumping them from memory, specifically targeting processes protected by dynamic code encryption.
+A PE dumper designed to handle protected executables.
+
+## Usage
+
+```
+ferrite -p <PROCESS_NAME> -d <OUTPUT_DIR> [OPTIONS]
+```
+
+### Required Arguments
+- `-p, --process`: Name of the target process
+- `-d, --output-dir`: Directory where the dumped file will be saved
+
+### Optional Arguments
+- `-t, --threshold`: Similarity threshold (default: 0.5)
+- `-r, --resolve-imports`: Enable import resolution
+
+### Example
+```
+ferrite -p RobloxPlayerBeta.exe -d C:/dumps --resolve-imports
+```
 
 ## How to use
 
 Run it from the command line:
 
 ```bash
-ferrite.exe -p <TARGET_PROCESS> -o <OUTPUT_FILE> --resolve-imports
+ferrite -p <TARGET_PROCESS> -o <OUTPUT_FILE> --resolve-imports
 ```
 
 If no output file is specified, the file will be saved to the current directory.
@@ -18,14 +37,14 @@ Ferrite will attempt to decrypt protected memory regions by reading and writing 
 
 You can control the decryption behavior using the `-t` or `--threshold` option with a value from `0.0` to `1.0`:
 ```bash
-ferrite.exe -p <TARGET_PROCESS> --threshold 0.5
+ferrite -p <TARGET_PROCESS> --threshold 0.5
 ```
 
 ### Import Resolution
 
 To reconstruct the import table for the main module, use the `-i` or `--resolve-imports` flag. This will locate and rebuild the import directory in memory. Note that this only affects the main module:
 ```bash
-ferrite.exe -p <TARGET_PROCESS> --resolve-imports
+ferrite -p <TARGET_PROCESS> --resolve-imports
 ```
 
 # TO-DO

@@ -14,8 +14,8 @@ struct Args {
     process: String,
 
     
-    #[arg(short, long)]
-    output: Option<String>,
+    #[arg(short = 'd', long = "output-dir", required = true)]
+    output: String,
 
     
     #[arg(short = 't', long = "threshold", default_value = "0.5")]
@@ -42,7 +42,7 @@ fn main() -> Result<()> {
         &args.process,
         args.threshold,
         args.resolve_imports,
-        args.output,
+        Some(args.output),
     )?;
 
     dumper.dump()?;

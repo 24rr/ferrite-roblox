@@ -77,6 +77,7 @@ impl Dumper {
 
         info!("Dumping PE image to file...");
         let buffer = pe.to_bytes()?;
+        std::fs::create_dir_all(&self.output_dir)?;
         let output_path = format!("{}/dumped.exe", self.output_dir);
         let mut file = File::create(&output_path)?;
         file.write_all(&buffer)?;
