@@ -19,6 +19,7 @@ use windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS;
 use windows::Win32::System::Memory::VirtualQueryEx;
 use windows::Win32::System::Memory::MEMORY_BASIC_INFORMATION;
 use windows::Win32::System::Memory::MEM_COMMIT;
+use indicatif::{ProgressBar, ProgressStyle};
 
 const CHUNK_SIZE: usize = 0x1000; 
 const MAX_SECTION_SIZE: usize = 0x40000000;
@@ -1027,6 +1028,14 @@ impl PEImage {
 
         let mut current_addr = self.base_address + reloc_dir.virtual_address as usize;
         let end_addr = current_addr + reloc_dir.size as usize;
+        let mut retry_count = 0;
+        let mut processed_size = 0;
+
+        let pb = ProgressBar::new(reloc_dir.size as u64);
+        pb.set_style(ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({bytes_per_sec})")
+            .unwrap()
+            .progress_chars("█░░"));
 
         #[repr(C)]
         #[derive(Debug, Copy, Clone)]
@@ -1035,111 +1044,94 @@ impl PEImage {
             block_size: u32,
         }
 
-        while current_addr < end_addr {
+        while current_addr < end_addr && retry_count < 10 {
             let mut reloc_block: BaseRelocation = unsafe { mem::zeroed() };
             let mut bytes_read = 0;
 
-            
-            for &protection in &[PAGE_EXECUTE_READ, PAGE_READONLY, PAGE_READWRITE] {
-                let mut old_protect = PAGE_PROTECTION_FLAGS(0);
-                if unsafe {
-                    VirtualProtectEx(
-                        self.process_handle,
-                        current_addr as _,
-                        mem::size_of::<BaseRelocation>(),
-                        protection,
-                        &mut old_protect,
-                    )
-                }.is_ok() {
-                    if unsafe {
-                        ReadProcessMemory(
-                            self.process_handle,
-                            current_addr as _,
-                            &mut reloc_block as *mut _ as _,
-                            mem::size_of::<BaseRelocation>(),
-                            Some(&mut bytes_read),
-                        )
-                    }.is_ok() && bytes_read == mem::size_of::<BaseRelocation>() {
-                        break;
-                    }
+            let read_ok = unsafe {
+                ReadProcessMemory(
+                    self.process_handle,
+                    current_addr as _,
+                    &mut reloc_block as *mut _ as _,
+                    mem::size_of::<BaseRelocation>(),
+                    Some(&mut bytes_read),
+                )
+            }.is_ok() && bytes_read == mem::size_of::<BaseRelocation>();
+
+            if !read_ok || reloc_block.block_size < 8 || reloc_block.block_size > 0x1000 {
+                retry_count += 1;
+                if retry_count >= 10 {
+                    warn!("Failed to read valid relocation block at {:x}, stopping", current_addr);
+                    break;
                 }
+                thread::sleep(Duration::from_millis(50));
+                continue;
             }
 
-            if bytes_read != mem::size_of::<BaseRelocation>() || reloc_block.block_size < 8 {
+            processed_size += reloc_block.block_size as usize;
+            pb.set_position(processed_size as u64);
+            
+            if processed_size > reloc_dir.size as usize {
+                warn!("Processed size exceeds relocation directory size");
                 break;
             }
 
             let num_entries = (reloc_block.block_size as usize - mem::size_of::<BaseRelocation>()) / 2;
-            let mut entries = vec![0u16; num_entries];
-            
-            
-            for &protection in &[PAGE_EXECUTE_READ, PAGE_READONLY, PAGE_READWRITE] {
-                let mut old_protect = PAGE_PROTECTION_FLAGS(0);
-                if unsafe {
-                    VirtualProtectEx(
-                        self.process_handle,
-                        (current_addr + mem::size_of::<BaseRelocation>()) as _,
-                        num_entries * 2,
-                        protection,
-                        &mut old_protect,
-                    )
-                }.is_ok() {
-                    if unsafe {
-                        ReadProcessMemory(
-                            self.process_handle,
-                            (current_addr + mem::size_of::<BaseRelocation>()) as _,
-                            entries.as_mut_ptr() as _,
-                            num_entries * 2,
-                            Some(&mut bytes_read),
-                        )
-                    }.is_ok() && bytes_read == num_entries * 2 {
-                        break;
-                    }
-                }
+            if num_entries > 1000 {
+                warn!("Suspiciously large number of entries: {}, skipping block", num_entries);
+                current_addr += mem::size_of::<BaseRelocation>();
+                continue;
             }
 
-            
-            for entry in entries {
-                let reloc_type = entry >> 12;
-                let offset = entry & 0xFFF;
+            let mut entries = vec![0u16; num_entries];
+            if unsafe {
+                ReadProcessMemory(
+                    self.process_handle,
+                    (current_addr + mem::size_of::<BaseRelocation>()) as _,
+                    entries.as_mut_ptr() as _,
+                    num_entries * 2,
+                    Some(&mut bytes_read),
+                )
+            }.is_ok() && bytes_read == num_entries * 2 {
+                for entry in entries {
+                    let reloc_type = entry >> 12;
+                    let offset = entry & 0xFFF;
 
-                if reloc_type == IMAGE_REL_BASED_DIR64 {
-                    let reloc_addr = self.base_address + reloc_block.page_rva as usize + offset as usize;
-                    let mut value: u64 = 0;
-                    
-                    
-                    if let Ok(()) = unsafe {
-                        ReadProcessMemory(
-                            self.process_handle,
-                            reloc_addr as _,
-                            &mut value as *mut _ as _,
-                            mem::size_of::<u64>(),
-                            None,
-                        )
-                    }.ok().context("Failed to read relocation value") {
-                        
-                        let adjusted_value = value.wrapping_sub(self.base_address as u64)
-                            .wrapping_add(self.base_address as u64);
-                        
+                    if reloc_type == IMAGE_REL_BASED_DIR64 {
+                        let reloc_addr = self.base_address + reloc_block.page_rva as usize + offset as usize;
+                        let mut value: u64 = 0;
                         
                         if let Ok(()) = unsafe {
-                            WriteProcessMemory(
+                            ReadProcessMemory(
                                 self.process_handle,
                                 reloc_addr as _,
-                                &adjusted_value as *const _ as _,
+                                &mut value as *mut _ as _,
                                 mem::size_of::<u64>(),
                                 None,
                             )
-                        } {
-                            debug!("Successfully processed relocation at {:x}", reloc_addr);
+                        }.ok().context("Failed to read relocation value") {
+                            let adjusted_value = value.wrapping_sub(self.base_address as u64)
+                                .wrapping_add(self.base_address as u64);
+                            
+                            let _ = unsafe {
+                                WriteProcessMemory(
+                                    self.process_handle,
+                                    reloc_addr as _,
+                                    &adjusted_value as *const _ as _,
+                                    mem::size_of::<u64>(),
+                                    None,
+                                )
+                            };
                         }
                     }
                 }
             }
 
             current_addr += reloc_block.block_size as usize;
+            retry_count = 0;
         }
 
+        pb.finish_and_clear();
         Ok(())
     }
 

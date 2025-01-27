@@ -38,10 +38,16 @@ impl Dumper {
         }
         .with_context(|| format!("Failed to open process: {}", process_name))?;
 
+        let default_dir = std::env::current_exe()?
+            .parent()
+            .context("Failed to get executable path")?
+            .to_string_lossy()
+            .into_owned();
+
         Ok(Self {
             process_handle,
             _threshold: threshold,
-            output_dir: output_dir.unwrap_or_else(|| ".".to_string()),
+            output_dir: output_dir.unwrap_or(default_dir),
         })
     }
 
