@@ -2,8 +2,14 @@
 
 A PE dumper designed to handle protected executables (mainly Roblox itself).
 
-![image](assets/image.png)
-![image](assets/image2.png)
+## Features
+- Memory-safe implementation in Rust
+- Handles protected and encrypted sections
+- Page-by-page memory reading for code sections
+- Proper PE header reconstruction
+- Import resolution support
+- Progress tracking with detailed logging
+
 ## Usage
 
 ```
@@ -23,36 +29,41 @@ ferrite -p <PROCESS_NAME> -d <OUTPUT_DIR> [OPTIONS]
 ferrite -p RobloxPlayerBeta.exe -d C:/dumps --resolve-imports
 ```
 
-## How to use
+## How It Works
 
-Run it from the command line:
+### Memory Reading
+- Code sections are read page by page to handle protected memory
+- Non-code sections are read in one go when possible
+- Proper memory protection detection and handling
+- Skips inaccessible or invalid memory regions
+
+### PE Reconstruction
+- Accurate DOS and NT headers reconstruction
+- Proper section header alignment and RVAs
+- Section characteristics preservation
+- Import directory handling
+- Proper memory-to-file mapping
+
+### Safety Features
+- Memory protection state validation
+- Size and boundary checks
+- Graceful handling of partial reads
+- Protected section handling
+
+## Known Limitations
+- Some anti-debug protections may interfere
+- Import resolution may be incomplete for heavily protected binaries
+- Some sections may be filled with NOPs if unreadable
+
+
+####
+- IT DOES NOT MODIFY MEM PROTECTIONS
+
+## Building
 
 ```bash
-ferrite -p <TARGET_PROCESS> -o <OUTPUT_FILE> --resolve-imports
+cargo build --release
 ```
-
-If no output file is specified, the file will be saved to the current directory.
-
-### Decryption
-
-Ferrite will attempt to decrypt protected memory regions by reading and writing back memory pages. Due to the nature of some protections, there might always be unreadable pages, so decryption could encounter partial reads. For best results, wait until at least 50% of the module is processed.
-
-You can control the decryption behavior using the `-t` or `--threshold` option with a value from `0.0` to `1.0`:
-```bash
-ferrite -p <TARGET_PROCESS> --threshold 0.5
-```
-
-### Import Resolution
-
-To reconstruct the import table for the main module, use the `-i` or `--resolve-imports` flag. This will locate and rebuild the import directory in memory. Note that this only affects the main module:
-```bash
-ferrite -p <TARGET_PROCESS> --resolve-imports
-```
-
-# TO-DO
-- Improve the dumping process
-- Add debug logs for nerds like me
-- Split pe.rs into parts cause editing it in one-file is a pain in the ass
 
 ### INSPIRED BY
 [Atrexus - Vulkan](https://github.com/atrexus/vulkan)
