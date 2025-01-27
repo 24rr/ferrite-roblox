@@ -2,6 +2,8 @@
 
 A PE dumper designed to handle protected executables.
 
+![image](assets/image.png)
+![image](assets/image2.png)
 ## Usage
 
 ```
