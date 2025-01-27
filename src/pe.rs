@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use std::mem;
-use windows::core::HRESULT;
-use windows::Win32::Foundation::{HANDLE, ERROR_PARTIAL_COPY};
-use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::ProcessStatus::{
     K32EnumProcessModules, K32GetModuleInformation, MODULEINFO,
 };
@@ -19,9 +18,9 @@ use windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS;
 use windows::Win32::System::Memory::VirtualQueryEx;
 use windows::Win32::System::Memory::MEMORY_BASIC_INFORMATION;
 use windows::Win32::System::Memory::MEM_COMMIT;
-use indicatif::{ProgressBar, ProgressStyle};
+use windows::Win32::System::Memory::PAGE_NOACCESS;
 
-const CHUNK_SIZE: usize = 0x1000; 
+const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
 const MAX_SECTION_SIZE: usize = 0x40000000;
 const MAX_IMAGE_SIZE: usize = 0x80000000;
 const VALID_SECTION_CHARS: &[u8] = b"._-$@0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -178,10 +177,6 @@ struct ImageImportDescriptor {
     name: u32,
     first_thunk: u32,
 }
-
-const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
-const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
-const IMAGE_REL_BASED_DIR64: u16 = 10;
 
 pub struct PEImage {
     base_address: usize,
@@ -420,142 +415,156 @@ impl PEImage {
             anyhow::bail!("Image size too large: {}", size);
         }
 
-        let mut buffer = Vec::with_capacity(size);
-        let mut address = self.base_address;
-        let mut remaining = size;
-        let mut consecutive_errors = 0;
-        let mut partial_read_count = 0;
-        let mut last_warn_address = 0;
-        let mut retry_count = 0;
-        let mut last_partial_warn = 0;
+        let mut buffer = vec![0u8; size];
+
+        unsafe {
+            std::ptr::write_unaligned(
+                buffer.as_mut_ptr() as *mut ImageDosHeader,
+                self._dos_header,
+            );
+        }
 
         
-        let mut current_chunk_size = CHUNK_SIZE;
+        let nt_headers_offset = self._dos_header.e_lfanew as usize;
+        let nt_headers_size = mem::size_of::<ImageNtHeaders64>();
+        unsafe {
+            std::ptr::write_unaligned(
+                buffer[nt_headers_offset..].as_mut_ptr() as *mut ImageNtHeaders64,
+                self.nt_headers,
+            );
+        }
 
-        while remaining > 0 {
-            let chunk_size = remaining.min(current_chunk_size);
-            let mut chunk = vec![0u8; chunk_size];
-            let mut bytes_read = 0;
-            let mut success = false;
+        
+        let first_section_offset = nt_headers_offset + nt_headers_size;
+        for (i, section) in self.sections.iter().enumerate() {
+            let section_header = ImageSectionHeader {
+                name: *b".text\0\0\0", 
+                misc: section.size as u32,
+                virtual_address: (section.address - self.base_address) as u32,
+                size_of_raw_data: section.size as u32,
+                pointer_to_raw_data: (section.address - self.base_address) as u32,
+                pointer_to_relocations: 0,
+                pointer_to_linenumbers: 0,
+                number_of_relocations: 0,
+                number_of_linenumbers: 0,
+                characteristics: section.characteristics,
+            };
 
             
-            for &protection in &[
-                PAGE_EXECUTE_READ,
-                PAGE_READONLY,
-                PAGE_READWRITE,
-                PAGE_EXECUTE_READWRITE,
-            ] {
-                let mut old_protect = PAGE_PROTECTION_FLAGS(0);
-                
-                
-                let protect_result = unsafe {
-                    VirtualProtectEx(
-                        self.process_handle,
-                        address as _,
-                        chunk_size,
-                        protection,
-                        &mut old_protect,
-                    )
-                };
+            if !section.name.is_empty() && section.name.len() <= 8 {
+                let mut name_bytes = [0u8; 8];
+                name_bytes[..section.name.len()].copy_from_slice(section.name.as_bytes());
+                unsafe {
+                    std::ptr::write_unaligned(
+                        &mut name_bytes as *mut [u8; 8],
+                        name_bytes,
+                    );
+                }
+            }
 
-                if protect_result.is_ok() {
-                    let read_result = unsafe {
-                        ReadProcessMemory(
-                            self.process_handle,
-                            address as _,
-                            chunk.as_mut_ptr() as _,
-                            chunk_size,
-                            Some(&mut bytes_read),
-                        )
-                    };
+            let section_header_offset = first_section_offset + i * mem::size_of::<ImageSectionHeader>();
+            unsafe {
+                std::ptr::write_unaligned(
+                    buffer[section_header_offset..].as_mut_ptr() as *mut ImageSectionHeader,
+                    section_header,
+                );
+            }
+        }
 
-                    unsafe {
-                        let _ = VirtualProtectEx(
-                            self.process_handle,
-                            address as _,
-                            chunk_size,
-                            old_protect,
-                            &mut old_protect,
-                        );
+        
+        for section in &self.sections {
+            let offset = section.address - self.base_address;
+            if offset + section.size > size {
+                warn!("Section at {:x} extends beyond image size, truncating", section.address);
+                continue;
+            }
+            
+            
+            if section.characteristics & 0x20000000 != 0 { 
+                
+                for i in 0..section.size {
+                    if offset + i < size {
+                        buffer[offset + i] = 0x90;
                     }
+                }
 
-                    match read_result {
-                        Ok(_) => {
-                            success = true;
-                            consecutive_errors = 0;
-                            
-                            if bytes_read == 0 {
-                                if address - last_warn_address >= 0x10000 { 
-                                    warn!("Skipping unreadable memory at {:x}", address);
-                                    last_warn_address = address;
-                                }
-                                chunk.resize(chunk_size, 0);
-                            } else if bytes_read < chunk_size {
-                                partial_read_count += 1;
-                                current_chunk_size = current_chunk_size.min(bytes_read);
-                                
-                                if partial_read_count == 1 || 
-                                   partial_read_count % 1000 == 0 || 
-                                   address - last_partial_warn >= 0x100000 {
-                                    warn!(
-                                        "Partial read at {:x} ({} partial reads so far)", 
-                                        address, 
-                                        partial_read_count
-                                    );
-                                    last_partial_warn = address;
-                                }
-                                chunk.truncate(bytes_read);
-                            } else {
-                                current_chunk_size = (current_chunk_size * 2).min(CHUNK_SIZE);
-                            }
-                        }
-                        Err(e) if e.code() == HRESULT::from(ERROR_PARTIAL_COPY) => {
-                            current_chunk_size /= 2;
-                            if current_chunk_size >= 0x100 {
-                                continue;
-                            }
-                            chunk.resize(chunk_size, 0);
-                            success = true;
-                        }
-                        Err(_) => {
-                            retry_count += 1;
-                            if retry_count < 10 {
-                                thread::sleep(Duration::from_millis(50));
-                            }
+                let pages = (section.size + 0xFFF) / 0x1000;
+                let mut pages_read = std::collections::HashSet::new();
+
+                while pages_read.len() < pages {
+                    for page in 0..pages {
+                        if pages_read.contains(&page) {
                             continue;
                         }
-                    }
 
-                    if success {
-                        break;
+                        let page_addr = section.address + (page * 0x1000);
+                        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+
+                        if unsafe {
+                            VirtualQueryEx(
+                                self.process_handle,
+                                Some(page_addr as *const _),
+                                &mut mbi,
+                                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                            )
+                        } == 0 {
+                            continue;
+                        }
+
+                        
+                        if mbi.State != MEM_COMMIT || mbi.Protect & PAGE_NOACCESS == PAGE_NOACCESS {
+                            continue;
+                        }
+
+                        let mut page_buffer = vec![0u8; 0x1000];
+                        let mut bytes_read = 0;
+
+                        if unsafe {
+                            ReadProcessMemory(
+                                self.process_handle,
+                                page_addr as _,
+                                page_buffer.as_mut_ptr() as _,
+                                0x1000,
+                                Some(&mut bytes_read),
+                            )
+                        }.is_ok() && bytes_read > 0 {
+                            let page_offset = offset + (page * 0x1000);
+                            if page_offset + bytes_read <= size {
+                                buffer[page_offset..page_offset + bytes_read].copy_from_slice(&page_buffer[..bytes_read]);
+                                pages_read.insert(page);
+                            }
+                        }
+
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            } else {
+                
+                let mut section_buffer = vec![0u8; section.size];
+                let mut bytes_read = 0;
+
+                if unsafe {
+                    ReadProcessMemory(
+                        self.process_handle,
+                        section.address as _,
+                        section_buffer.as_mut_ptr() as _,
+                        section.size,
+                        Some(&mut bytes_read),
+                    )
+                }.is_ok() && bytes_read > 0 && offset + bytes_read <= size {
+                    buffer[offset..offset + bytes_read].copy_from_slice(&section_buffer[..bytes_read]);
+                } else {
+                    warn!("Failed to read section at {:x}, filling with zeros", section.address);
+                    for i in 0..section.size {
+                        if offset + i < size {
+                            buffer[offset + i] = 0;
+                        }
                     }
                 }
             }
-
-            if !success {
-                consecutive_errors += 1;
-                if consecutive_errors > 3 {
-                    warn!("Too many consecutive read errors, stopping at {:x}", address);
-                    break;
-                }
-                if address - last_warn_address >= 0x10000 {
-                    warn!("Failed to read at {:x}", address);
-                    last_warn_address = address;
-                }
-                chunk.resize(chunk_size, 0);
-            }
-
-            buffer.extend_from_slice(&chunk);
-            address += chunk.len();
-            remaining = remaining.saturating_sub(chunk.len());
-            retry_count = 0;
         }
 
-        if buffer.is_empty() {
-            anyhow::bail!("Failed to read any data from the process");
-        }
-
-        info!("Memory read complete: {} partial reads, {} total bytes", partial_read_count, buffer.len());
+        info!("Memory read complete: {} total bytes", buffer.len());
         Ok(buffer)
     }
 
@@ -1021,117 +1030,8 @@ impl PEImage {
     }
 
     pub fn process_relocations(&self) -> Result<()> {
-        let reloc_dir = &self.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-        if reloc_dir.virtual_address == 0 {
-            return Ok(());
-        }
-
-        let mut current_addr = self.base_address + reloc_dir.virtual_address as usize;
-        let end_addr = current_addr + reloc_dir.size as usize;
-        let mut retry_count = 0;
-        let mut processed_size = 0;
-
-        let pb = ProgressBar::new(reloc_dir.size as u64);
-        pb.set_style(ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({bytes_per_sec})")
-            .unwrap()
-            .progress_chars("█░░"));
-
-        #[repr(C)]
-        #[derive(Debug, Copy, Clone)]
-        struct BaseRelocation {
-            page_rva: u32,
-            block_size: u32,
-        }
-
-        while current_addr < end_addr && retry_count < 10 {
-            let mut reloc_block: BaseRelocation = unsafe { mem::zeroed() };
-            let mut bytes_read = 0;
-
-            let read_ok = unsafe {
-                ReadProcessMemory(
-                    self.process_handle,
-                    current_addr as _,
-                    &mut reloc_block as *mut _ as _,
-                    mem::size_of::<BaseRelocation>(),
-                    Some(&mut bytes_read),
-                )
-            }.is_ok() && bytes_read == mem::size_of::<BaseRelocation>();
-
-            if !read_ok || reloc_block.block_size < 8 || reloc_block.block_size > 0x1000 {
-                retry_count += 1;
-                if retry_count >= 10 {
-                    warn!("Failed to read valid relocation block at {:x}, stopping", current_addr);
-                    break;
-                }
-                thread::sleep(Duration::from_millis(50));
-                continue;
-            }
-
-            processed_size += reloc_block.block_size as usize;
-            pb.set_position(processed_size as u64);
-            
-            if processed_size > reloc_dir.size as usize {
-                warn!("Processed size exceeds relocation directory size");
-                break;
-            }
-
-            let num_entries = (reloc_block.block_size as usize - mem::size_of::<BaseRelocation>()) / 2;
-            if num_entries > 1000 {
-                warn!("Suspiciously large number of entries: {}, skipping block", num_entries);
-                current_addr += mem::size_of::<BaseRelocation>();
-                continue;
-            }
-
-            let mut entries = vec![0u16; num_entries];
-            if unsafe {
-                ReadProcessMemory(
-                    self.process_handle,
-                    (current_addr + mem::size_of::<BaseRelocation>()) as _,
-                    entries.as_mut_ptr() as _,
-                    num_entries * 2,
-                    Some(&mut bytes_read),
-                )
-            }.is_ok() && bytes_read == num_entries * 2 {
-                for entry in entries {
-                    let reloc_type = entry >> 12;
-                    let offset = entry & 0xFFF;
-
-                    if reloc_type == IMAGE_REL_BASED_DIR64 {
-                        let reloc_addr = self.base_address + reloc_block.page_rva as usize + offset as usize;
-                        let mut value: u64 = 0;
-                        
-                        if let Ok(()) = unsafe {
-                            ReadProcessMemory(
-                                self.process_handle,
-                                reloc_addr as _,
-                                &mut value as *mut _ as _,
-                                mem::size_of::<u64>(),
-                                None,
-                            )
-                        }.ok().context("Failed to read relocation value") {
-                            let adjusted_value = value.wrapping_sub(self.base_address as u64)
-                                .wrapping_add(self.base_address as u64);
-                            
-                            let _ = unsafe {
-                                WriteProcessMemory(
-                                    self.process_handle,
-                                    reloc_addr as _,
-                                    &adjusted_value as *const _ as _,
-                                    mem::size_of::<u64>(),
-                                    None,
-                                )
-                            };
-                        }
-                    }
-                }
-            }
-
-            current_addr += reloc_block.block_size as usize;
-            retry_count = 0;
-        }
-
-        pb.finish_and_clear();
+        
+        
         Ok(())
     }
 
