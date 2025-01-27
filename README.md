@@ -2,6 +2,8 @@
 
 A PE dumper designed to handle protected executables (mainly Roblox itself).
 
+![demo](assets/demo.png)
+
 ## Features
 - Memory-safe implementation in Rust
 - Handles protected and encrypted sections
