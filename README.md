@@ -7,7 +7,7 @@ Ferrite is a memory dumping tool inspired by Vulkan, rewritten in Rust for enhan
 Run it from the command line:
 
 ```bash
-ferrite -p <TARGET_PROCESS> -o <OUTPUT_FILE> --resolve-imports
+ferrite.exe -p <TARGET_PROCESS> -o <OUTPUT_FILE> --resolve-imports
 ```
 
 If no output file is specified, the file will be saved to the current directory.
@@ -18,14 +18,14 @@ Ferrite will attempt to decrypt protected memory regions by reading and writing 
 
 You can control the decryption behavior using the `-t` or `--threshold` option with a value from `0.0` to `1.0`:
 ```bash
-ferrite -p <TARGET_PROCESS> --threshold 0.5
+ferrite.exe -p <TARGET_PROCESS> --threshold 0.5
 ```
 
 ### Import Resolution
 
 To reconstruct the import table for the main module, use the `-i` or `--resolve-imports` flag. This will locate and rebuild the import directory in memory. Note that this only affects the main module:
 ```bash
-ferrite -p <TARGET_PROCESS> --resolve-imports
+ferrite.exe -p <TARGET_PROCESS> --resolve-imports
 ```
 
 # TO-DO
