@@ -1,6 +1,6 @@
 # Ferrite
 
-A PE dumper designed to handle protected executables.
+A PE dumper designed to handle protected executables (mainly Roblox itself).
 
 ![image](assets/image.png)
 ![image](assets/image2.png)
